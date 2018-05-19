@@ -1,0 +1,8 @@
+[package]
+name = "cl_completer"
+version = "0.1.0"
+authors = ["sirkibsirkib <christopher.esterhuyse@gmail.com>"]
+
+[dependencies]
+slab = "0.4"
+nom = "4.0.0"
