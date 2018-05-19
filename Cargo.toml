@@ -1,8 +1,9 @@
 [package]
-name = "cl_completer"
+name = "combinatory"
 version = "0.1.0"
 authors = ["sirkibsirkib <christopher.esterhuyse@gmail.com>"]
 
 [dependencies]
 slab = "0.4"
 nom = "4.0.0"
+fnv = "1.0.6"
