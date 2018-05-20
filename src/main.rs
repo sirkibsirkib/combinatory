@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_variables)]
+
 #[macro_use]
 extern crate nom;
 
@@ -149,32 +151,19 @@ impl TermBase {
 		}
 		if let Term::Ap(l, r) = t {
 			if l == self.i_key {
-				// self.ref_down(key); // delete Ix
-				// self.ref_down(l); 	// delete I
-				return r;           // keep   x
+				return r;
 			}
-
-			// K
 			if let Term::Ap(ll, lr) = self.slab[l].term {
 				if ll == self.k_key {
-					// self.ref_down(key);	// delete Kxy
-					// self.ref_down(l);	// delete Kx
-					// self.ref_down(ll); 	// delete K
-					// self.ref_down(r);	// delete y
-					return lr; 			// keep   x
+					return lr;
 				}
 			}
-
-			// S
 			if let Term::Ap(ll, lr) = self.slab[l].term {
 				if let Term::Ap(lll, llr) = self.slab[ll].term {
 					if lll == self.s_key {
 						let left = self.find_and_ref_up(Term::Ap(llr, r));
 						let right = self.find_and_ref_up(Term::Ap(lr, r));
 						let whole = self.find_and_ref_up(Term::Ap(left, right));
-						// self.ref_down(key); // delete Sxyz
-						// self.ref_down(l);	// delete Sxy
-						// self.ref_down(ll);	// delete Sx
 						return whole;
 					}
 				}
@@ -253,22 +242,6 @@ impl TermBase {
 		}
 	}
 
-	// fn is_redex(&self, key: usize) -> bool {
-	// 	let t = self.slab[key].term;
-	// 	if t.atomic() {
-	// 		return false;
-	// 	}
-	// 	match t {
-	// 		Term::Ap(l, r) => {
-	// 			self.ref_down_recursively(l);
-	// 			self.ref_down_recursively(r);
-	// 		},
-	// 		Term::Abs(v, term) => {
-	// 			self.ref_down_recursively(term);
-	// 		}
-	// 	}
-	// }
-
 	fn print_maybe_parens(&self, key: usize) {
 		if self.slab[key].term.atomic() {
 			self.print_term(key);
@@ -316,13 +289,10 @@ impl TermBase {
 		for root in roots {
 			for key in Traverser::new(self, TraversalOrder::LeftmostOutermost, root) {
 				set.insert(key);
-				print!("... <{}> ", key);
-				self.print_term(key);
-				println!();
 			}
 		}
-		println!("retaining {:?} things", set.len());
-		self.slab.retain(|key, _| set.contains(&key));
+		self.slab_locator.retain(|key, _t| set.contains(&key));
+		self.slab.retain(|key, _t| set.contains(&key));
 	}
 
 
@@ -401,22 +371,13 @@ impl<'a, 'b> Parser<'a, 'b> {
 		};
 		let x = parser.parse_term();
 		if parser.at != src.len() {
-			// parser.cleanup(x);
 			return None
 		} else {
 			x
 		}
 	}
 
-	// fn cleanup(&mut self, key: Option<usize>) {
-	// 	if let Some(key) = key {
-	// 		self.tb.ref_down_recursively(key);
-	// 	}
-	// 	self.at = self.src.len()
-	// }
-
 	fn push_raw_term(&mut self, o: &mut Option<usize>, t: Term, abs_vec: &mut Vec<char>) {
-		// println!("printing {:?}", t);
 		let n = self.tb.find_and_ref_up(t);
 		self.push_raw_term2(o, n, abs_vec)
 	}
@@ -434,16 +395,6 @@ impl<'a, 'b> Parser<'a, 'b> {
 			x = self.tb.find_and_ref_up(new_term);
 		}
 		*o = Some(x)	
-	}
-
-	fn parse_abs(&mut self) {
-		println!("parse abs");
-		loop {
-			let c = self.src[self.at] as char;
-			self.at += 1;
-			
-		}
-
 	}
 
 	fn parse_term(&mut self) -> Option<usize> {
@@ -474,7 +425,6 @@ impl<'a, 'b> Parser<'a, 'b> {
 						if let Some(x) = self.parse_term() {
 							self.push_raw_term2(&mut o, x, &mut abs_vec);
 						} else {
-							// self.cleanup(o);
 							return None;
 						}
 					},
@@ -501,9 +451,6 @@ impl<'a, 'b> Parser<'a, 'b> {
 	}
 }
 
-use std::io::{BufRead};
-
-
 fn main() {
 	let mut tb = TermBase::new();
 	let stdin = io::stdin();
@@ -524,7 +471,7 @@ fn main() {
 				print!("   ");
 				tb.print_term(k);
 				println!();
-				for _ in 0..20 {
+				for _ in 0..32 {
 					if tb.normal_form(k) {
 						continue 'outer;
 					}
@@ -538,36 +485,7 @@ fn main() {
     	} else {
     		println!("Failed to understand");
     	}
-    	// tb.gc_all_but_defined();
+    	println!("defined {:?}", tb.defined.iter().collect::<Vec<_>>());
+    	tb.gc_all_but_defined();
 	}
 }
- //    let line2 = iterator.next().unwrap().unwrap();
-
-
-	// let args: Vec<String> = env::args().collect();
-	// if args.len() != 2 {
-	// 	print!("Expecting 1 arg!");
-	// 	return;
-	// }
-	// if let Some(mut k) = Parser::parse(&mut tb, &args[1].as_bytes()) {
-	// 	// print!("<{:?}> ", k);
-	// 	print!("   ");
-	// 	tb.print_term(k);
-	// 	println!();
-	// 	// println!(">> {:?}", &tb);
-	// 	for _ in 0..20 {
-	// 		tb.gc_all_but(std::iter::once(k));
-	// 		if tb.normal_form(k) {
-	// 			return;
-	// 		}
-	// 		k = tb.outermost_leftmost(k);
-	// 		print!("-> ");
-	// 		tb.print_term(k);
-	// 		println!();
-	// 	}
-	// 	println!("...");
-	// } else {
-	// 	println!("Failed to parse");
-	// }
-// }
-
