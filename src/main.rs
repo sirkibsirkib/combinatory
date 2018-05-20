@@ -2,7 +2,7 @@
 extern crate nom;
 
 extern crate fnv;
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 
 extern crate slab;
 use slab::Slab;
@@ -30,7 +30,6 @@ enum RewriteKey {
 struct TermEntry {
 	term: Term,
 	rewrite_key: RewriteKey,
-	refcounts: usize,
 }
 
 
@@ -41,6 +40,18 @@ enum Term {
 	Ap(usize, usize),
 	Abs(char, usize),
 }
+impl Term {
+	pub fn atomic(&self) -> bool {
+		match self {
+			Term::I |
+			Term::K |
+			Term::S |
+			Term::Var(_) => true,
+			Term::Ap(_,_) |
+			Term::Abs(_,_) => false,
+		}
+	}
+}
 
 type TSlab = Slab<TermEntry>;
 
@@ -48,6 +59,7 @@ type TSlab = Slab<TermEntry>;
 struct TermBase {
 	slab: TSlab,
 	slab_locator: FnvHashMap<usize, usize>, //term digest to slab key
+	defined: FnvHashMap<char, usize>,
 	i_key: usize,
 	k_key: usize,
 	s_key: usize,
@@ -57,6 +69,7 @@ impl TermBase {
 		let mut t = TermBase {
 			slab: TSlab::with_capacity(128),
 			slab_locator: FnvHashMap::default(),
+			defined: FnvHashMap::default(),
 			i_key: 0,
 			k_key: 0,
 			s_key: 0,
@@ -74,33 +87,27 @@ impl TermBase {
 			hasher.finish() as usize
 		};
 		if let Some(&slab_key) = self.slab_locator.get(&h) {
-			self.slab[slab_key].refcounts += 1;
 			slab_key
 		} else {
 			let slab_key = self.slab.insert(TermEntry {
 				term: term,
 				rewrite_key: RewriteKey::Unknown,
-				refcounts: 1,
 			});
 			self.slab_locator.insert(h, slab_key);
 			slab_key
 		}
 	}
 
-	fn ref_down(&mut self, key: usize) {
-		//TODO invalid keys. removing stuff too often somewhere
-		self.slab[key].refcounts -= 1;
-		if self.slab[key].refcounts == 0{
-			self.slab.remove(key);
-		}
-	}
-
-	fn ref_up(&mut self, key: usize) {
-		self.slab[key].refcounts += 1;
-	}
-
 	fn root_can_rewrite(&mut self, key: usize) -> bool {
 		let t = self.slab[key].term;
+		if let Term::Abs(v, a) = t {
+			let q = self.slab[a].term;
+			if q.atomic() {
+				return true
+			} else if let Term::Ap(al, ar) = q {
+				return true
+			}
+		}
 		if let Term::Ap(l, r) = t {
 			if l == self.i_key {
 				return true
@@ -123,20 +130,37 @@ impl TermBase {
 
 	fn root_rewrite(&mut self, key: usize) -> usize {
 		let t = self.slab[key].term;
+		if let Term::Abs(v, a) = t {
+			let q = self.slab[a].term;
+			if q.atomic() {
+				if let Term::Var(x) = q {
+					if v == x { return self.i_key }
+				}
+				let k = self.k_key;
+				return self.find_and_ref_up(Term::Ap(k, a));
+			} else if let Term::Ap(al, ar) = q {
+				let s = self.s_key;
+				let new_left = self.find_and_ref_up(Term::Abs(v, al));
+				let new_right = self.find_and_ref_up(Term::Abs(v, ar));
+				let inner = self.find_and_ref_up(Term::Ap(s, new_left));
+				let outer = self.find_and_ref_up(Term::Ap(inner, new_right));
+				return outer;
+			}
+		}
 		if let Term::Ap(l, r) = t {
 			if l == self.i_key {
-				self.ref_down(key); // delete Ix
-				self.ref_down(l); 	// delete I
+				// self.ref_down(key); // delete Ix
+				// self.ref_down(l); 	// delete I
 				return r;           // keep   x
 			}
 
 			// K
 			if let Term::Ap(ll, lr) = self.slab[l].term {
 				if ll == self.k_key {
-					self.ref_down(key);	// delete Kxy
-					self.ref_down(l);	// delete Kx
-					self.ref_down(ll); 	// delete K
-					self.ref_down(r);	// delete y
+					// self.ref_down(key);	// delete Kxy
+					// self.ref_down(l);	// delete Kx
+					// self.ref_down(ll); 	// delete K
+					// self.ref_down(r);	// delete y
 					return lr; 			// keep   x
 				}
 			}
@@ -148,9 +172,9 @@ impl TermBase {
 						let left = self.find_and_ref_up(Term::Ap(llr, r));
 						let right = self.find_and_ref_up(Term::Ap(lr, r));
 						let whole = self.find_and_ref_up(Term::Ap(left, right));
-						self.ref_down(key); // delete Sxyz
-						self.ref_down(l);	// delete Sxy
-						self.ref_down(ll);	// delete Sx
+						// self.ref_down(key); // delete Sxyz
+						// self.ref_down(l);	// delete Sxy
+						// self.ref_down(ll);	// delete Sx
 						return whole;
 					}
 				}
@@ -176,7 +200,10 @@ impl TermBase {
 					&& self.normal_form(r)
 					&& !self.root_can_rewrite(key)
 				}
-				Term::Abs(v, term) => self.normal_form(term),
+				Term::Abs(v, term) => {
+					!self.root_can_rewrite(key)
+					&& self.normal_form(term)
+				}
 			} {
 				self.slab[key].rewrite_key = RewriteKey::NormalForm;
 			} else {
@@ -195,8 +222,6 @@ impl TermBase {
 		let t = self.slab[key].term;
 		let new_key = self.root_rewrite(key);
 		if new_key != key {
-			// self.ref_up(new_key);
-			// self.ref_down(key);
 			return new_key;
 		}
 		match t {
@@ -208,13 +233,11 @@ impl TermBase {
 				let x = self.outermost_leftmost(l);
 				if x != l {
 					let z = self.find_and_ref_up(Term::Ap(x, r));
-					self.ref_down(key);
 					return z;
 				}
 				let x = self.outermost_leftmost(r);
 				if x != r {
 					let z = self.find_and_ref_up(Term::Ap(l, x));
-					self.ref_down(key);
 					return z;
 				}
 				panic!("WTF shortcut didnt help me");
@@ -223,7 +246,6 @@ impl TermBase {
 				let x = self.outermost_leftmost(term);
 				if x != term {
 					let z = self.find_and_ref_up(Term::Abs(v, x));
-					self.ref_down(key);
 					return z;
 				}
 				panic!("WTF MANG");
@@ -231,33 +253,29 @@ impl TermBase {
 		}
 	}
 
-	fn ref_down_recursively(&mut self, key: usize) {
-		let t = self.slab[key].term;
-		match t {
-			Term::I |
-			Term::K |
-			Term::S |
-			Term::Var(_) => (),
-			Term::Ap(l, r) => {
-				self.ref_down_recursively(l);
-				self.ref_down_recursively(r);
-			},
-			Term::Abs(v, term) => {
-				self.ref_down_recursively(term);
-			}
-		}
-		self.ref_down(key);
-	}
+	// fn is_redex(&self, key: usize) -> bool {
+	// 	let t = self.slab[key].term;
+	// 	if t.atomic() {
+	// 		return false;
+	// 	}
+	// 	match t {
+	// 		Term::Ap(l, r) => {
+	// 			self.ref_down_recursively(l);
+	// 			self.ref_down_recursively(r);
+	// 		},
+	// 		Term::Abs(v, term) => {
+	// 			self.ref_down_recursively(term);
+	// 		}
+	// 	}
+	// }
 
 	fn print_maybe_parens(&self, key: usize) {
-		// println!("MAYBE PARENS {:?}", key);
-		let t = self.slab[key].term;
-		if let Term::Ap(_,_) = t {
+		if self.slab[key].term.atomic() {
+			self.print_term(key);
+		} else {
 			print!("(");
 			self.print_term(key);
 			print!(")");
-		} else {
-			self.print_term(key);
 		}
 	}
 
@@ -285,111 +303,91 @@ impl TermBase {
         }
 	}
 
-	// fn parse(&mut self, s: &[u8]) -> Option<usize> {
-	// 	let mut at = 0;
-	// 	let mut term = 
-	// 	self.parse_inner_term(s, &mut at)
-	// }
+	fn gc_all_but_defined(&mut self) {
+		let x: Vec<_> = self.defined.values().map(|x| *x).collect();
+		self.gc_all_but(x.into_iter())
+	}
 
-	// fn parse_inner_abs(&mut self, s: &[u8], at: &mut usize) -> Option<usize> {
-		
-	// }
-
-	// fn parse_inner_term(&mut self, s: &[u8], at: &mut usize) -> Option<usize> {
-	// 	while *at < s.len() {
-	// 		match s[*at] as char {
-	// 			' ' => (),
-	// 			'[' => parse_inner_abs()
-	// 			']' => return (at, None),
-	// 			'(' => {
-	// 				let (x, t) = self.parse(&s[at+1..]);
-	// 				at += x;
-	// 				if let Some(t) = t {
-	// 					self.nest_right(&mut holding, &mut abs, t);
-	// 				} else {
-	// 					return (at, None)
-	// 				}
-	// 			},
-	// 			')' => {at += 1; break;}
-	// 			'S' => self.nest_right(&mut holding, &mut abs, Term::S),
-	// 			'K' => self.nest_right(&mut holding, &mut abs, Term::K),
-	// 			'I' => self.nest_right(&mut holding, &mut abs, Term::I),
-	// 			v => self.nest_right(&mut holding, &mut abs, Term::Var(v)),
-	// 		}
-	// 	}
-	// }
-
-
-	// fn nest_right(&mut self, holding: &mut Option<Term>, abs: &mut Vec<char>, inner: Term) {
-	// 	if let Some(ref mut h) = holding {
-	// 		let t = Term::Ap()
-	// 		*h = Term::Ap(Box::new((
-	// 			h.clone(),
-	// 			inner,
-	// 		)));
-	// 	} else {
-	// 		*holding = Some(inner);
-	// 	}
-	// 	while let Some(v) = abs.pop() {
-	// 		if let Some(ref mut h) = holding {
-	// 			*h = Term::Abs(Box::new((
-	// 				v,
-	// 				h.clone(),
-	// 			)));
-	// 		} else {
-	// 			panic!();
-	// 		}
-	// 	}
-	// }
+	fn gc_all_but(&mut self, roots: impl Iterator<Item=usize>) {
+		let mut set = FnvHashSet::default();
+		set.insert(self.i_key);
+		set.insert(self.k_key);
+		set.insert(self.s_key);
+		for root in roots {
+			for key in Traverser::new(self, TraversalOrder::LeftmostOutermost, root) {
+				set.insert(key);
+				print!("... <{}> ", key);
+				self.print_term(key);
+				println!();
+			}
+		}
+		println!("retaining {:?} things", set.len());
+		self.slab.retain(|key, _| set.contains(&key));
+	}
 
 
 
-	// fn parse(&mut self, s: &[u8]) -> (usize, Option<usize>) {
-	// 	let mut abs = vec![];
-	// 	let mut abs_on = false;
-	// 	let mut holding: Option<Term> = None;
-	// 	let mut at = 0;
-	// 	while at < s.len() {
-	// 		if abs_on {
-	// 			match s[at] as char {
-	// 				' ' => (),
-	// 				']' => abs_on = false,
-	// 				'S'|'K'|'I'|'['|'('|')' => return (at, None),
-	// 				v => abs.push(v),
-	// 			}
-	// 		} else {
-	// 			match s[at] as char {
-	// 				' ' => (),
-	// 				'[' => abs_on = true,
-	// 				']' => return (at, None),
-	// 				'(' => {
-	// 					let (x, t) = self.parse(&s[at+1..]);
-	// 					at += x;
-	// 					if let Some(t) = t {
-	// 						self.nest_right(&mut holding, &mut abs, t);
-	// 					} else {
-	// 						return (at, None)
-	// 					}
-	// 				},
-	// 				')' => {at += 1; break;}
-	// 				'S' => self.nest_right(&mut holding, &mut abs, Term::S),
-	// 				'K' => self.nest_right(&mut holding, &mut abs, Term::K),
-	// 				'I' => self.nest_right(&mut holding, &mut abs, Term::I),
-	// 				v => self.nest_right(&mut holding, &mut abs, Term::Var(v)),
-	// 			};
-	// 		}
-	// 		at += 1;
-	// 	}
-	// 	if abs_on || !abs.is_empty() {
-	// 		return (at, None)
-	// 	}
-	// 	(at, holding)
-	// }
+	fn define(&mut self, varname: char, key: usize) {
+		self.defined.insert(varname, key);
+	}
+}
+
+enum TraversalOrder {
+	LeftmostOutermost,
+}
+
+struct Traverser<'a> {
+	tb: &'a TermBase,
+	traversal_order: TraversalOrder,
+	stack: Vec<usize>,
+}
+impl<'a> Traverser<'a> {
+	pub fn new(tb: &'a TermBase, traversal_order: TraversalOrder, root: usize) -> Traverser<'a> {
+		Traverser {
+			tb,
+			traversal_order,
+			stack: vec![root],
+		}
+	}
+}
+
+impl<'a> Iterator for Traverser<'a>{
+    type Item = usize;
+    fn next(&mut self) -> Option<Self::Item> {
+    	if let Some(key) = self.stack.pop() {
+    		match self.tb.slab[key].term {
+	        	Term::Ap(l, r) => {
+	        		match self.traversal_order {
+	        			TraversalOrder::LeftmostOutermost => {
+	        				self.stack.push(r);
+			        		self.stack.push(l);
+			        		Some(key)
+	        			}
+	        		}
+	        	},
+	        	Term::Abs(v, k) => {
+	        		match self.traversal_order {
+	        			TraversalOrder::LeftmostOutermost => {
+	        				self.stack.push(k);
+	        				Some(key)
+	        			}
+	        		}
+	        	},
+	        	Term::I |
+	        	Term::K |
+	        	Term::S |
+	        	Term::Var(_) => Some(key),
+	        }
+    	} else {
+    		None
+    	}
+    }
 }
 
 struct Parser<'a, 'b> {
 	tb: &'a mut TermBase,
 	at: usize,
+	abs: Vec<char>,
 	src: &'b [u8],
 }
 
@@ -399,98 +397,177 @@ impl<'a, 'b> Parser<'a, 'b> {
 			tb,
 			at: 0,
 			src,
+			abs: vec![],
 		};
 		let x = parser.parse_term();
 		if parser.at != src.len() {
-			parser.cleanup(x);
+			// parser.cleanup(x);
 			return None
 		} else {
 			x
 		}
 	}
 
-	fn cleanup(&mut self, key: Option<usize>) {
-		if let Some(key) = key {
-			self.tb.ref_down_recursively(key);
-		}
-		self.at = self.src.len()
-	}
+	// fn cleanup(&mut self, key: Option<usize>) {
+	// 	if let Some(key) = key {
+	// 		self.tb.ref_down_recursively(key);
+	// 	}
+	// 	self.at = self.src.len()
+	// }
 
-	fn push_raw_term(&mut self, o: &mut Option<usize>, t: Term) {
+	fn push_raw_term(&mut self, o: &mut Option<usize>, t: Term, abs_vec: &mut Vec<char>) {
 		// println!("printing {:?}", t);
 		let n = self.tb.find_and_ref_up(t);
-		self.push_raw_term2(o, n)
+		self.push_raw_term2(o, n, abs_vec)
 	}
 
-	fn push_raw_term2(&mut self, o: &mut Option<usize>, n: usize) {
-		if let Some(prev) = *o {
+	fn push_raw_term2(&mut self, o: &mut Option<usize>, n: usize, abs_vec: &mut Vec<char>) {
+		let mut x = if let Some(mut prev) = *o {
 			let a = Term::Ap(prev, n);
 			let q = self.tb.find_and_ref_up(a);
-			*o = Some(q);
+			q
 		} else {
-			*o = Some(n);
+			n
+		};
+		for v in abs_vec.drain(..).rev() {
+			let new_term = Term::Abs(v, x);
+			x = self.tb.find_and_ref_up(new_term);
 		}
+		*o = Some(x)	
+	}
+
+	fn parse_abs(&mut self) {
+		println!("parse abs");
+		loop {
+			let c = self.src[self.at] as char;
+			self.at += 1;
+			
+		}
+
 	}
 
 	fn parse_term(&mut self) -> Option<usize> {
 		let mut o: Option<usize> = None;
+		let mut abs_vec = vec![];
+		let mut abs = false;
 		loop {
 			let c = self.src[self.at] as char;
 			self.at += 1;
-			match c {
-				' ' => (),
-				'(' => {
-					if let Some(x) = self.parse_term() {
-						self.push_raw_term2(&mut o, x);
-					} else {
-						self.cleanup(o);
-						return None;
-					}
-				},
-				')' => return o,
-				'S' => self.push_raw_term(&mut o, Term::S),
-				'K' => self.push_raw_term(&mut o, Term::K),
-				'I' => self.push_raw_term(&mut o, Term::I),
-				 v  => self.push_raw_term(&mut o, Term::Var(v)),
-			};
+			if abs {
+				match c {
+					' ' => (),
+					'('|')'|'S'|'K'|'I'|'[' => return None,
+				 	']' => abs = false,
+					 v  => {
+					 	if let Some(&key) = self.tb.defined.get(&v) {
+					 		return None;
+					 	} else {
+					 		abs_vec.push(v);
+					 	}				 	
+					},
+				}
+			} else {
+				match c {
+					'[' => abs = true,
+					' ' => (),
+					'(' => {
+						if let Some(x) = self.parse_term() {
+							self.push_raw_term2(&mut o, x, &mut abs_vec);
+						} else {
+							// self.cleanup(o);
+							return None;
+						}
+					},
+					']' => return None,
+					')' => return o,
+					'S' => self.push_raw_term(&mut o, Term::S, &mut abs_vec),
+					'K' => self.push_raw_term(&mut o, Term::K, &mut abs_vec),
+					'I' => self.push_raw_term(&mut o, Term::I, &mut abs_vec),
+					 v  => {
+					 	if let Some(&key) = self.tb.defined.get(&v) {
+					 		println!("MATCHED defined TERM {:?}", v);
+					 		self.push_raw_term2(&mut o, key, &mut abs_vec);
+					 	} else {
+					 		self.push_raw_term(&mut o, Term::Var(v), &mut abs_vec);
+					 	}				 	
+					},
+				};
+			}
 			if self.at >= self.src.len() {
 				break;
 			}
 		}
 		o
 	}
-	fn digest_abs(&mut self, c: char) {
-		//TODO push down abstractions! gonna be fun. include that in rewriting
-	}
 }
 
-
+use std::io::{BufRead};
 
 
 fn main() {
 	let mut tb = TermBase::new();
-	let args: Vec<String> = env::args().collect();
-	if args.len() != 2 {
-		print!("Expecting 1 arg!");
-	}
-	if let Some(mut k) = Parser::parse(&mut tb, &args[1].as_bytes()) {
-		// print!("<{:?}> ", k);
-		print!("   ");
-		tb.print_term(k);
-		println!();
-		// println!(">> {:?}", &tb);
-		for _ in 0..20 {
-			if tb.normal_form(k) {
-				return;
+	let stdin = io::stdin();
+    let mut iterator = stdin.lock().lines();
+    'outer: loop {
+    	let line1 = iterator.next().unwrap().unwrap();
+    	let bytes = line1.as_bytes();
+    	// if bytes.len()
+    	if bytes.len() >= 3 && bytes[1] as char == '=' {
+    		if let Some(mut k) = Parser::parse(&mut tb, &bytes[2..]) {
+    			println!("DEFINING");
+    			tb.define(bytes[0] as char, k);
+    			println!("defined <{},{}>", bytes[0] as char, k);
+    		}
+    	} else if bytes.len() >= 3 && bytes[0] as char == '>' && bytes[1] as char == '*' {
+    		if let Some(mut k) = Parser::parse(&mut tb, &bytes[2..]) {
+    			println!("REWRITING");
+				print!("   ");
+				tb.print_term(k);
+				println!();
+				for _ in 0..20 {
+					if tb.normal_form(k) {
+						continue 'outer;
+					}
+					k = tb.outermost_leftmost(k);
+					print!("-> ");
+					tb.print_term(k);
+					println!();
+				}
+				println!("...");
 			}
-			k = tb.outermost_leftmost(k);
-			print!("-> ");
-			tb.print_term(k);
-			println!();
-		}
-		println!("...");
-	} else {
-		println!("Failed to parse");
+    	} else {
+    		println!("Failed to understand");
+    	}
+    	// tb.gc_all_but_defined();
 	}
 }
+ //    let line2 = iterator.next().unwrap().unwrap();
+
+
+	// let args: Vec<String> = env::args().collect();
+	// if args.len() != 2 {
+	// 	print!("Expecting 1 arg!");
+	// 	return;
+	// }
+	// if let Some(mut k) = Parser::parse(&mut tb, &args[1].as_bytes()) {
+	// 	// print!("<{:?}> ", k);
+	// 	print!("   ");
+	// 	tb.print_term(k);
+	// 	println!();
+	// 	// println!(">> {:?}", &tb);
+	// 	for _ in 0..20 {
+	// 		tb.gc_all_but(std::iter::once(k));
+	// 		if tb.normal_form(k) {
+	// 			return;
+	// 		}
+	// 		k = tb.outermost_leftmost(k);
+	// 		print!("-> ");
+	// 		tb.print_term(k);
+	// 		println!();
+	// 	}
+	// 	println!("...");
+	// } else {
+	// 	println!("Failed to parse");
+	// }
+// }
 
